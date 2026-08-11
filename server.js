@@ -6,9 +6,11 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- EARLY LOGGING & SIZE CHECK MIDDLEWARE ---
+// --- EARLY LOGGING & PRE-BODY BYTE COUNTER MIDDLEWARE ---
 // Runs BEFORE body-parsers so we see Content-Length and can return a
-// friendly 413 if a client is sending a huge payload.
+// friendly 413 if a client is sending a huge payload. It also listens
+// to the raw incoming stream to catch chunked requests where Content-Length
+// is missing.
 app.use((req, res, next) => {
   const lenHeader = req.headers['content-length'];
   const contentLength = lenHeader ? parseInt(lenHeader, 10) : NaN;
@@ -18,6 +20,7 @@ app.use((req, res, next) => {
   const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 5 * 1024 * 1024; // 5 MB
 
   if (!isNaN(contentLength) && contentLength > MAX_BYTES) {
+    console.log('Content-Length too large, rejecting early:', contentLength);
     return res.status(413).json({
       error: {
         message: `Payload too large. Content-Length = ${contentLength}. Max allowed = ${MAX_BYTES} bytes. If you need to upload files, upload to object storage (S3/R2) and send a URL instead.`,
@@ -27,7 +30,43 @@ app.use((req, res, next) => {
     });
   }
 
-  // If Content-Length is missing (chunked transfer), continue — the body parser will enforce its limits.
+  // For chunked requests (no Content-Length), listen to the stream and count bytes.
+  let received = 0;
+  let exceeded = false;
+
+  function onData(chunk) {
+    received += chunk.length;
+    if (!exceeded && received > MAX_BYTES) {
+      exceeded = true;
+      console.log('Pre-body limit exceeded', received);
+      try {
+        // Send friendly 413 and close the connection.
+        res.status(413).json({
+          error: {
+            message: `Payload too large. Received ${received} bytes which exceeds the allowed ${MAX_BYTES} bytes.`,
+            type: 'invalid_request_error',
+            code: 413
+          }
+        });
+      } catch (e) {
+        console.error('Error sending 413 after pre-body exceeded:', e.message);
+      }
+      // Destroy the request to stop further processing and free memory.
+      try { req.destroy(); } catch (e) {}
+    }
+  }
+
+  function onEnd() {
+    if (!exceeded) console.log('Pre-body total bytes:', received);
+    // clean up listeners (defensive)
+    req.removeListener('data', onData);
+    req.removeListener('end', onEnd);
+  }
+
+  req.on('data', onData);
+  req.on('end', onEnd);
+
+  // continue to next middleware (body-parser will still run unless we destroyed the req above)
   next();
 });
 

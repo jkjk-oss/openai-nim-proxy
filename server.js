@@ -17,7 +17,7 @@ app.use((req, res, next) => {
   console.log('Incoming', req.method, req.path, 'Content-Length=', contentLength, 'Content-Type=', req.headers['content-type']);
 
   // Configure a conservative default max size (bytes). You can override with env MAX_REQUEST_BYTES.
-  const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 20 * 1024 * 1024; // 20 MB
+  const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 50 * 1024 * 1024; // 50 MB
 
   if (!isNaN(contentLength) && contentLength > MAX_BYTES) {
     console.log('Content-Length too large, rejecting early:', contentLength);
@@ -73,8 +73,9 @@ app.use((req, res, next) => {
 // Middleware
 app.use(cors());
 // Increase express.json limit (app-level). Note: platform front-proxies (Railway) may still reject larger requests before they reach the app.
-app.use(express.json({ limit: '200mb' }));
-app.use(express.urlencoded({ limit: '200mb', extended: true }));
+// Set to 50mb per your request.
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';

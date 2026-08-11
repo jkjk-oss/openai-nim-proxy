@@ -6,8 +6,34 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- EARLY LOGGING & SIZE CHECK MIDDLEWARE ---
+// Runs BEFORE body-parsers so we see Content-Length and can return a
+// friendly 413 if a client is sending a huge payload.
+app.use((req, res, next) => {
+  const lenHeader = req.headers['content-length'];
+  const contentLength = lenHeader ? parseInt(lenHeader, 10) : NaN;
+  console.log('Incoming', req.method, req.path, 'Content-Length=', contentLength, 'Content-Type=', req.headers['content-type']);
+
+  // Configure a conservative default max size (bytes). You can override with env MAX_REQUEST_BYTES.
+  const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 5 * 1024 * 1024; // 5 MB
+
+  if (!isNaN(contentLength) && contentLength > MAX_BYTES) {
+    return res.status(413).json({
+      error: {
+        message: `Payload too large. Content-Length = ${contentLength}. Max allowed = ${MAX_BYTES} bytes. If you need to upload files, upload to object storage (S3/R2) and send a URL instead.`,
+        type: 'invalid_request_error',
+        code: 413
+      }
+    });
+  }
+
+  // If Content-Length is missing (chunked transfer), continue — the body parser will enforce its limits.
+  next();
+});
+
 // Middleware
 app.use(cors());
+// Increase express.json limit if needed. Note: platform front-proxies (Railway) may still reject larger requests.
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -215,8 +241,19 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    console.error('Proxy error:', error.message, error.response?.status, error.response?.data);
     
+    // Friendly error for upstream 413
+    if (error.response?.status === 413) {
+      return res.status(413).json({
+        error: {
+          message: 'Upstream returned 413 Payload Too Large. Consider reducing request size or using object storage for large files.',
+          type: 'invalid_request_error',
+          code: 413
+        }
+      });
+    }
+
     res.status(error.response?.status || 500).json({
       error: {
         message: error.message || 'Internal server error',
@@ -236,6 +273,22 @@ app.all('*', (req, res) => {
       code: 404
     }
   });
+});
+
+// Express error handler - friendly message for body-parser's PayloadTooLargeError
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    console.error('PayloadTooLargeError caught by handler:', err.message);
+    return res.status(413).json({
+      error: {
+        message: 'Payload too large. The server or platform rejected the request. Try sending less data or upload large files to object storage and send a URL instead.',
+        type: 'invalid_request_error',
+        code: 413
+      }
+    });
+  }
+  // Fall through to default Express handler
+  next(err);
 });
 
 app.listen(PORT, () => {

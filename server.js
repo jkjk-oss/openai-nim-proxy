@@ -15,7 +15,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
+// 🔥 REASONING DISPLAY TOGGLE - 
 const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it

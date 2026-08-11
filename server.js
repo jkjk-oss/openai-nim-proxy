@@ -17,7 +17,7 @@ app.use((req, res, next) => {
   console.log('Incoming', req.method, req.path, 'Content-Length=', contentLength, 'Content-Type=', req.headers['content-type']);
 
   // Configure a conservative default max size (bytes). You can override with env MAX_REQUEST_BYTES.
-  const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 5 * 1024 * 1024; // 5 MB
+  const MAX_BYTES = process.env.MAX_REQUEST_BYTES ? parseInt(process.env.MAX_REQUEST_BYTES, 10) : 20 * 1024 * 1024; // 20 MB
 
   if (!isNaN(contentLength) && contentLength > MAX_BYTES) {
     console.log('Content-Length too large, rejecting early:', contentLength);
@@ -72,15 +72,15 @@ app.use((req, res, next) => {
 
 // Middleware
 app.use(cors());
-// Increase express.json limit if needed. Note: platform front-proxies (Railway) may still reject larger requests.
-app.use(express.json({ limit: '100mb' }));
-app.use(express.urlencoded({ limit: '100mb', extended: true }));
+// Increase express.json limit (app-level). Note: platform front-proxies (Railway) may still reject larger requests before they reach the app.
+app.use(express.json({ limit: '200mb' }));
+app.use(express.urlencoded({ limit: '200mb', extended: true }));
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - 
+// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
@@ -125,11 +125,27 @@ app.get('/v1/models', (req, res) => {
 // Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
-    
+    // Defensive: ensure body exists
+    const body = req.body || {};
+    const { model, temperature, max_tokens, stream } = body;
+
+    // Trim messages to last N to avoid large payloads coming from clients
+    const KEEP_MESSAGES = process.env.KEEP_MESSAGES ? parseInt(process.env.KEEP_MESSAGES, 10) : 6; // default 6
+    let messages = (body.messages || []).slice(-KEEP_MESSAGES);
+
+    // Truncate very long individual messages to avoid huge single fields (chars)
+    const MAX_MESSAGE_CHARS = process.env.MAX_MESSAGE_CHARS ? parseInt(process.env.MAX_MESSAGE_CHARS, 10) : 20000; // 20k chars
+    messages = messages.map(m => {
+      if (!m || typeof m.content !== 'string') return m;
+      if (m.content.length > MAX_MESSAGE_CHARS) {
+        return { ...m, content: m.content.slice(0, MAX_MESSAGE_CHARS) + '\n\n...[truncated]' };
+      }
+      return m;
+    });
+
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
+    if (!nimModel && typeof model === 'string') {
       try {
         await axios.post(`${NIM_API_BASE}/chat/completions`, {
           model: model,
@@ -146,7 +162,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       } catch (e) {}
       
       if (!nimModel) {
-        const modelLower = model.toLowerCase();
+        const modelLower = String(model || '').toLowerCase();
         if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
           nimModel = 'meta/llama-3.1-405b-instruct';
         } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
@@ -173,7 +189,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Authorization': `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      responseType: stream ? 'stream' : 'json'
+      responseType: stream ? 'stream' : 'json',
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
     });
     
     if (stream) {

@@ -33,7 +33,7 @@ const { timingSafeEqual } = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Configuration ───────────────────────────────────────────────────────────
+// ─── Configuration ─────────────────────────────────────────────────────────
 
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
@@ -326,7 +326,7 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
   }
 }
 
-// ─── Middleware ─────────────────────────────────────────────────────────────
+// ─── Middleware ────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -378,7 +378,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Validation ─────────────────────────────────────────────────────────────
+// ─── Validation ────────────────────────────────────────────────────────────
 
 async function validateModels() {
   if (SKIP_VALIDATION) {

@@ -22,6 +22,12 @@
 //    Default behavior is now clean `content` + structured `reasoning`/`reasoning_content` fields.
 //    GoonChat (or any legacy client that expects inline tags) can opt-in by sending the
 //    `x-reasoning-format: inline` header.
+//
+// === THIS REVISION (bug fix) ===
+// 5. `tools` (and `tool_choice`) from the incoming request body were being read to compute
+//    `hasTools` for the reasoning payload, but were never actually forwarded to NIM in
+//    `baseRequest`. Any client sending function/tool calls would have them silently dropped
+//    upstream. Fixed below.
 
 const express = require('express');
 const cors = require('cors');
@@ -503,7 +509,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.2.0' });
+  res.json({ status: 'ok', version: '2.2.1' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -528,7 +534,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages,
       temperature,
       max_tokens,
-      stream
+      stream,
+      tools,
+      tool_choice
     } = req.body;
 
     const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
@@ -540,6 +548,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false
     };
+
+    // FIX: forward tools/tool_choice to NIM if the client sent them.
+    // Previously these were read only to compute hasTools for the reasoning
+    // payload, but never actually included in the outgoing request body.
+    if (tools) baseRequest.tools = tools;
+    if (tool_choice) baseRequest.tool_choice = tool_choice;
 
     const { response, model: usedModel } = await callWithFallback(
       baseRequest,

@@ -29,6 +29,8 @@
 //    `baseRequest`. Any client sending function/tool calls would have them silently dropped
 //    upstream. Fixed below.
 
+require('./polyfill.js'); // must run before anything else touches globalThis
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');

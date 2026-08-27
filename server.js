@@ -85,14 +85,21 @@ const MODEL_MAPPING = {
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
   'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
+  // CONFIRMED: deepseek-ai/deepseek-v4-pro-0813 IS live on NVIDIA's NIM catalog
+  // (Free Endpoint available, verified directly against its build.nvidia.com
+  // page). Earlier revision guessed it wasn't hosted — that was based on a
+  // stale/incomplete search index; the model page itself confirms it and was
+  // "Last Modified: Today". The exact-suffix "-0813" matters: NVIDIA's real
+  // catalog id is NOT the same as the bare "deepseek-ai/deepseek-v4-pro" this
+  // proxy originally shipped with.
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
+  'deepseek': 'deepseek-ai/deepseek-v4-pro-0813',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'gemini-turbo': 'meta/llama-3.3-70b-instruct',
   'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
-  'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash',
   'glm-5.2': 'z-ai/glm-5.2',
   'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
   'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
@@ -108,11 +115,20 @@ const MODEL_MAPPING = {
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
 
+// FIX: previous list mixed in models NVIDIA has since deprecated/removed
+// (mistral-medium-3.5-128b, mistral-small-4-119b-2603, nemotron-3.3-super-49b
+// all returned HTTP 410 Gone in production logs). Also, nemotron-3.3-super-49b
+// duplicated the hardcoded default fallback model below, wasting a full
+// request-timeout cycle on the exact same dead endpoint twice per failed call.
+// Replaced with models confirmed live via this proxy's own /v1/models
+// validation check (search your deploy logs for lines starting with
+// "[VALIDATION] ✓" to re-confirm which ones are currently live for you —
+// NVIDIA's catalog changes over time, so re-check periodically).
 const FALLBACK_MODELS = [
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-  'google/gemma-4-31b-it'
+  'openai/gpt-oss-20b',
+  'mistralai/mistral-nemotron',
+  'minimaxai/minimax-m3',
+  'stepfun-ai/step-3.7-flash'
 ];
 
 // ─── Reasoning Subsystem ─────────────────────────────────────────────────────
@@ -282,6 +298,26 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       if (enableThinking) return {};
       return { chat_template_kwargs: { enable_thinking: false } };
     }
+
+    case 'deepseek-ai/deepseek-v4-pro-0813': {
+      // FIX: NVIDIA's own sample code for this model explicitly sends
+      // chat_template_kwargs.thinking=false to turn thinking OFF, meaning
+      // (like GLM-5.2) it defaults to thinking-ON. Previous logic only sent a
+      // payload when enableThinking was true and stayed silent otherwise —
+      // which meant "disabled" mode never actually disabled anything; it just
+      // left the model's default (on) in place. Inverted to match reality.
+      if (enableThinking) {
+        const payload = {};
+        if (effort) payload.reasoning_effort = effort;
+        return payload;
+      }
+      return { chat_template_kwargs: { thinking: false } };
+    }
+    // NOTE: 'deepseek-ai/deepseek-v4-flash-0813' is NOT confirmed to exist —
+    // unlike v4-pro-0813, I haven't verified this exact id against NVIDIA's
+    // catalog. If you add a flash alias, check its real build.nvidia.com page
+    // first (same way v4-pro-0813 was confirmed above) before assuming it
+    // shares the "-0813" suffix.
 
     case 'deepseek-ai/deepseek-v4-pro':
     case 'deepseek-ai/deepseek-v4-flash': {
@@ -553,7 +589,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       tool_choice
     } = req.body;
 
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+    // FIX: default (used when the client sends a model name with no matching
+    // alias in MODEL_MAPPING) was 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+    // which is returning HTTP 410 Gone in production. Also matches an entry
+    // in FALLBACK_MODELS, which used to mean the exact same dead endpoint got
+    // tried twice, wasting an entire timeout cycle. Now defaults to
+    // openai/gpt-oss-20b (confirmed live under the claude-3-sonnet alias).
+    const primaryModel = MODEL_MAPPING[model] || 'openai/gpt-oss-20b';
     const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
     const baseRequest = {

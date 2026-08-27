@@ -52,7 +52,12 @@ const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const MAX_TOKENS_LIMIT = 65536;
-const REQUEST_TIMEOUT_MS = 180000;
+// FIX: was hardcoded to 180000ms (3 min) per model attempt. With up to 5 models
+// in the fallback chain (primary + 4 FALLBACK_MODELS), a fully-stuck upstream
+// model could hang the whole request for up to 15 minutes before the client
+// ever saw an error. Lowered default to 45s and made it configurable via env
+// so you can tune per-model wait time without editing code.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 45000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
@@ -497,14 +502,21 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
+      // FIX: distinguish a hung/timed-out upstream from an actual error response,
+      // so logs make it obvious which model never answered vs which one was
+      // rejected outright (bad model id, auth, etc.)
+      const isTimeout = err.code === 'ECONNABORTED' || /timeout/i.test(err.message);
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
-        err.response?.status,
+        isTimeout ? `TIMED OUT after ${REQUEST_TIMEOUT_MS}ms` : (err.response?.status || ''),
         err.response?.data?.error?.message || err.message
       );
     }
   }
 
+  if (lastError) {
+    lastError.lastAttemptedModel = models[models.length - 1];
+  }
   throw lastError || new Error('All models failed');
 }
 
@@ -812,7 +824,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('[PROXY] Fatal error:', error.message);
+    console.error('[PROXY] Fatal error:', error.message, error.lastAttemptedModel ? `(last tried: ${error.lastAttemptedModel})` : '');
     console.error('[PROXY] NIM response:', error.response?.data);
 
     if (!res.headersSent) {
@@ -820,7 +832,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         error: {
           message: error.message,
           type: 'invalid_request_error',
-          code: error.response?.status || 500
+          code: error.response?.status || 500,
+          last_attempted_model: error.lastAttemptedModel
         }
       });
     } else if (!res.writableEnded) {

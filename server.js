@@ -80,55 +80,49 @@ validateConfig();
 
 // ─── Model Mapping ─────────────────────────────────────────────────────────
 
+// FIX: rebuilt from scratch against two hard requirements — (1) confirmed
+// present in NVIDIA's live NIM catalog (per this proxy's own /v1/models
+// validation check), and (2) confirmed 500k+ token context window (checked
+// against each model's own build.nvidia.com page / NVIDIA docs, not just
+// marketing copy). Only THREE models on NVIDIA's current free-tier catalog
+// clear both bars — everything else (Kimi K2.6: 256K, MiniMax M2.5: ~205K,
+// DeepSeek V3.2: 160K, GPT-OSS/Mistral/Gemma variants: 128K or less) was
+// removed rather than kept at a smaller context size. Many aliases below
+// intentionally point at the same underlying model — there just aren't three
+// distinct 500k+ context options per "family" on NVIDIA's catalog today.
+// Re-verify periodically: NVIDIA adds/removes/renames catalog models often
+// (this is exactly how deepseek-v4-pro-0813 vs deepseek-v4-pro bit you).
 const MODEL_MAPPING = {
+  // nvidia/nemotron-3-super-120b-a12b — 1M token context, confirmed live
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
+  'gpt-3.5': 'nvidia/nemotron-3-super-120b-a12b',
+  'claude-3-sonnet': 'nvidia/nemotron-3-super-120b-a12b',
+  'gemini-turbo': 'nvidia/nemotron-3-super-120b-a12b',
+  'google-light': 'nvidia/nemotron-3-super-120b-a12b',
+
+  // nvidia/nemotron-3-ultra-550b-a55b — 1M token context, confirmed live
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
-  'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
-  'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  // CONFIRMED: deepseek-ai/deepseek-v4-pro-0813 IS live on NVIDIA's NIM catalog
-  // (Free Endpoint available, verified directly against its build.nvidia.com
-  // page). Earlier revision guessed it wasn't hosted — that was based on a
-  // stale/incomplete search index; the model page itself confirms it and was
-  // "Last Modified: Today". The exact-suffix "-0813" matters: NVIDIA's real
-  // catalog id is NOT the same as the bare "deepseek-ai/deepseek-v4-pro" this
-  // proxy originally shipped with.
+  'gpt-4-turbo': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'claude-3-opus': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'mistral': 'nvidia/nemotron-3-ultra-550b-a55b',
+
+  // deepseek-ai/deepseek-v4-pro-0813 — 1M token context, confirmed live
+  // (exact catalog id includes the -0813 suffix — see note above)
   'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
   'deepseek': 'deepseek-ai/deepseek-v4-pro-0813',
-  'claude-3-opus': 'openai/gpt-oss-120b',
-  'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-  'gemini-turbo': 'meta/llama-3.3-70b-instruct',
-  'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
-  'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
-  'glm-5.2': 'z-ai/glm-5.2',
-  'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
-  'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
-  'mistral-pro': 'mistralai/mistral-small-4-119b-2603',
-  'mistral-nemo': 'mistralai/mistral-nemotron',
-  'mistral-fast': 'mistralai/ministral-14b-instruct-2512',
-  'google-light': 'google/gemma-4-31b-it',
-  'google-lightest': 'google/gemma-2-2b-it',
-  'google-lighter': 'google/gemma-3n-e4b-it',
-  'm2.7': 'minimaxai/minimax-m2.7',
-  'm3': 'minimaxai/minimax-m3',
-  'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
-  'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
+  'gemini-pro': 'deepseek-ai/deepseek-v4-pro-0813'
 };
 
-// FIX: previous list mixed in models NVIDIA has since deprecated/removed
-// (mistral-medium-3.5-128b, mistral-small-4-119b-2603, nemotron-3.3-super-49b
-// all returned HTTP 410 Gone in production logs). Also, nemotron-3.3-super-49b
-// duplicated the hardcoded default fallback model below, wasting a full
-// request-timeout cycle on the exact same dead endpoint twice per failed call.
-// Replaced with models confirmed live via this proxy's own /v1/models
-// validation check (search your deploy logs for lines starting with
-// "[VALIDATION] ✓" to re-confirm which ones are currently live for you —
-// NVIDIA's catalog changes over time, so re-check periodically).
+// FIX: restricted to the OTHER two models that meet the 500k+ context bar
+// (see MODEL_MAPPING comment above for why only three qualify at all). The
+// previous fallback list included sub-500k models (gpt-oss-20b: 128K,
+// mistral-nemotron: 128K, minimax-m3/step-3.7-flash: unconfirmed, likely
+// similar) — defeating the point of choosing long-context models as primaries
+// if a request could silently fall back to a short-context one.
 const FALLBACK_MODELS = [
-  'openai/gpt-oss-20b',
-  'mistralai/mistral-nemotron',
-  'minimaxai/minimax-m3',
-  'stepfun-ai/step-3.7-flash'
+  'nvidia/nemotron-3-ultra-550b-a55b',
+  'deepseek-ai/deepseek-v4-pro-0813',
+  'nvidia/nemotron-3-super-120b-a12b'
 ];
 
 // ─── Reasoning Subsystem ─────────────────────────────────────────────────────
@@ -589,14 +583,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       tool_choice
     } = req.body;
 
-    // FIX: default (used when the client sends a model name with no matching
-    // alias in MODEL_MAPPING) was 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-    // which is returning HTTP 410 Gone in production. Also matches an entry
-    // in FALLBACK_MODELS, which used to mean the exact same dead endpoint got
-    // tried twice, wasting an entire timeout cycle. Now defaults to
-    // openai/gpt-oss-20b (confirmed live under the claude-3-sonnet alias).
-    const primaryModel = MODEL_MAPPING[model] || 'openai/gpt-oss-20b';
-    const modelChain = [primaryModel, ...FALLBACK_MODELS];
+    // FIX: default (used when the client's model string matches no alias)
+    // was 'openai/gpt-oss-20b' (128K context) — now that MODEL_MAPPING only
+    // contains 500k+ context models, an unmapped request falling back to a
+    // short-context model would be an inconsistent surprise. Defaults to the
+    // same model as gpt-3.5-turbo.
+    const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3-super-120b-a12b';
+    // FIX: since FALLBACK_MODELS now draws from the same small pool of
+    // qualifying models as MODEL_MAPPING, primaryModel can collide with an
+    // entry already in FALLBACK_MODELS. Deduped so the exact same endpoint
+    // is never attempted twice in one request (each attempt costs a full
+    // REQUEST_TIMEOUT_MS if that endpoint is down).
+    const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
 
     const baseRequest = {
       messages,

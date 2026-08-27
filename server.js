@@ -119,9 +119,11 @@ const MODEL_MAPPING = {
 // mistral-nemotron: 128K, minimax-m3/step-3.7-flash: unconfirmed, likely
 // similar) — defeating the point of choosing long-context models as primaries
 // if a request could silently fall back to a short-context one.
+// deepseek-v4-pro-0813 is intentionally NOT listed here — it's now forced
+// to the front of every model chain below, so listing it again here would
+// just be a no-op after dedup. Order below is what gets tried AFTER it.
 const FALLBACK_MODELS = [
   'nvidia/nemotron-3-ultra-550b-a55b',
-  'deepseek-ai/deepseek-v4-pro-0813',
   'nvidia/nemotron-3-super-120b-a12b'
 ];
 
@@ -589,12 +591,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     // short-context model would be an inconsistent surprise. Defaults to the
     // same model as gpt-3.5-turbo.
     const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3-super-120b-a12b';
-    // FIX: since FALLBACK_MODELS now draws from the same small pool of
-    // qualifying models as MODEL_MAPPING, primaryModel can collide with an
-    // entry already in FALLBACK_MODELS. Deduped so the exact same endpoint
-    // is never attempted twice in one request (each attempt costs a full
-    // REQUEST_TIMEOUT_MS if that endpoint is down).
-    const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+    // FIX: per request, DeepSeek is now always tried FIRST regardless of
+    // which alias the client sent (previously, whatever model an alias
+    // mapped to — e.g. gpt-4 -> nemotron-3-ultra — occupied the first slot,
+    // so DeepSeek only got a turn if it happened to be the primary or if the
+    // mapped model failed first). Falls through to whatever the alias
+    // actually mapped to, then the remaining FALLBACK_MODELS, if DeepSeek
+    // doesn't answer. Dedup keeps the exact same endpoint from being tried
+    // twice in one request (each attempt costs a full REQUEST_TIMEOUT_MS if
+    // that endpoint is down).
+    const DEEPSEEK_MODEL = 'deepseek-ai/deepseek-v4-pro-0813';
+    const modelChain = [...new Set([DEEPSEEK_MODEL, primaryModel, ...FALLBACK_MODELS])];
 
     const baseRequest = {
       messages,

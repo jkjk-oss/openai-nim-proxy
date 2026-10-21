@@ -269,9 +269,10 @@ Error: connect ECONNREFUSED 127.0.0.1:3000
 |-------|---------------|
 | `gpt-3.5-turbo` | nvidia/nemotron-3-super-120b-a12b |
 | `gpt-4` | nvidia/nemotron-3-ultra-550b-a55b |
-| `gpt-4o` | deepseek-ai/deepseek-v4-pro |
+| `gpt-4o` | deepseek-ai/deepseek-v4-pro-0813 |
 | `gpt-4-flash` | deepseek-ai/deepseek-v4-flash |
 | `glm-5.2` | z-ai/glm-5.2 |
+| `glm-5.3-flash` | z-ai/glm-5.3-flash |
 | `mistral` | mistralai/mistral-large-3-675b-instruct-2512 |
 | `mistral-turbo` | mistralai/mistral-medium-3.5-128b |
 | `gemini-pro` | nvidia/llama-3.3-nemotron-super-49b-v1.5 |
@@ -349,3 +350,4 @@ pm2 startup
 ---
 
 **Happy proxying! 🎉**
+

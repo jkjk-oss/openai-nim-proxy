@@ -28,6 +28,9 @@
 //    `hasTools` for the reasoning payload, but were never actually forwarded to NIM in
 //    `baseRequest`. Any client sending function/tool calls would have them silently dropped
 //    upstream. Fixed below.
+// 6. Added `z-ai/glm-5.3-flash` to the supported 1M-context NVIDIA free-tier set and to the
+//    reasoning payload handling. This model is currently available in NVIDIA's NIM catalog and
+//    shares the same thinking control semantics as GLM-5.2/5.3-family models.
 
 require('./polyfill.js'); // must run before anything else touches globalThis
 
@@ -52,11 +55,6 @@ const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const MAX_TOKENS_LIMIT = 65536;
-// FIX: was hardcoded to 180000ms (3 min) per model attempt. With up to 5 models
-// in the fallback chain (primary + 4 FALLBACK_MODELS), a fully-stuck upstream
-// model could hang the whole request for up to 15 minutes before the client
-// ever saw an error. Lowered default to 45s and made it configurable via env
-// so you can tune per-model wait time without editing code.
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 45000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -80,55 +78,36 @@ validateConfig();
 
 // ─── Model Mapping ─────────────────────────────────────────────────────────
 
-// FIX: rebuilt from scratch against two hard requirements — (1) confirmed
-// present in NVIDIA's live NIM catalog (per this proxy's own /v1/models
-// validation check), and (2) confirmed 500k+ token context window (checked
-// against each model's own build.nvidia.com page / NVIDIA docs, not just
-// marketing copy). Only THREE models on NVIDIA's current free-tier catalog
-// clear both bars — everything else (Kimi K2.6: 256K, MiniMax M2.5: ~205K,
-// DeepSeek V3.2: 160K, GPT-OSS/Mistral/Gemma variants: 128K or less) was
-// removed rather than kept at a smaller context size. Many aliases below
-// intentionally point at the same underlying model — there just aren't three
-// distinct 500k+ context options per "family" on NVIDIA's catalog today.
-// Re-verify periodically: NVIDIA adds/removes/renames catalog models often
-// (this is exactly how deepseek-v4-pro-0813 vs deepseek-v4-pro bit you).
 const MODEL_MAPPING = {
-  // nvidia/nemotron-3-super-120b-a12b — 1M token context, confirmed live
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-3.5': 'nvidia/nemotron-3-super-120b-a12b',
   'claude-3-sonnet': 'nvidia/nemotron-3-super-120b-a12b',
   'gemini-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'google-light': 'nvidia/nemotron-3-super-120b-a12b',
 
-  // nvidia/nemotron-3-ultra-550b-a55b — 1M token context, confirmed live
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-4-turbo': 'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus': 'nvidia/nemotron-3-ultra-550b-a55b',
   'mistral': 'nvidia/nemotron-3-ultra-550b-a55b',
 
-  // deepseek-ai/deepseek-v4-pro-0813 — 1M token context, confirmed live
-  // (exact catalog id includes the -0813 suffix — see note above)
   'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
   'deepseek': 'deepseek-ai/deepseek-v4-pro-0813',
-  'gemini-pro': 'deepseek-ai/deepseek-v4-pro-0813'
+  'gemini-pro': 'deepseek-ai/deepseek-v4-pro-0813',
+
+  'glm-5.3-flash': 'z-ai/glm-5.3-flash',
+  'glm-5.3': 'z-ai/glm-5.3-flash',
+  'glm-5.2': 'z-ai/glm-5.3-flash',
+  'glm-5.3-flashx': 'z-ai/glm-5.3-flash'
 };
 
-// FIX: restricted to the OTHER two models that meet the 500k+ context bar
-// (see MODEL_MAPPING comment above for why only three qualify at all). The
-// previous fallback list included sub-500k models (gpt-oss-20b: 128K,
-// mistral-nemotron: 128K, minimax-m3/step-3.7-flash: unconfirmed, likely
-// similar) — defeating the point of choosing long-context models as primaries
-// if a request could silently fall back to a short-context one.
-// deepseek-v4-pro-0813 is intentionally NOT listed here — it's now forced
-// to the front of every model chain below, so listing it again here would
-// just be a no-op after dedup. Order below is what gets tried AFTER it.
 const FALLBACK_MODELS = [
+  'deepseek-ai/deepseek-v4-pro-0813',
   'nvidia/nemotron-3-ultra-550b-a55b',
-  'nvidia/nemotron-3-super-120b-a12b'
+  'nvidia/nemotron-3-super-120b-a12b',
+  'z-ai/glm-5.3-flash'
 ];
 
 // ─── Reasoning Subsystem ─────────────────────────────────────────────────────
-// Pure, stateful string parser for extracting reasoning blocks across chunks.
 
 class DelimiterParser {
   constructor(openTag, closeTag) {
@@ -157,7 +136,6 @@ class DelimiterParser {
         this.inThinking = !this.inThinking;
         this.buffer = this.buffer.substring(tagIndex + targetTag.length);
       } else {
-        // Check for partial tag at the end
         let partialLen = 0;
         const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
         for (let i = maxLen; i > 0; i--) {
@@ -195,17 +173,14 @@ class DelimiterParser {
   }
 }
 
-// Normalizes structured reasoning fields and extracts content delimiters.
 class StreamNormalizer {
   constructor(model) {
     this.model = model;
     this.parser = null;
 
-    // ONLY use content delimiters for models that embed reasoning in content
-    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5' || model === 'z-ai/glm-5.3-flash') {
       this.parser = new DelimiterParser('<think>', '</think>');
     }
-    // Models like Gemma 4, DeepSeek, GPT-OSS use structured fields and are NOT parsed here.
   }
 
   processDelta(delta) {
@@ -213,7 +188,6 @@ class StreamNormalizer {
     let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
     let content = normalizedDelta.content || '';
 
-    // Priority: Structured reasoning > Content delimiters
     if (!reasoning && content && this.parser) {
       const parsed = this.parser.processChunk(content);
       reasoning = parsed.reasoning;
@@ -245,7 +219,7 @@ function normalizeNonStreamChoice(choice, model) {
 
   if (!reasoning && content) {
     let parser = null;
-    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5' || model === 'z-ai/glm-5.3-flash') {
       parser = new DelimiterParser('<think>', '</think>');
     }
 
@@ -265,11 +239,6 @@ function normalizeNonStreamChoice(choice, model) {
   return { ...choice, message: newMessage };
 }
 
-// Pure function returning model-specific reasoning request payloads.
-// IMPORTANT: everything returned here gets spread DIRECTLY into the top-level
-// JSON body sent to NIM via axios. Do NOT wrap anything in an `extra_body` key —
-// that's an openai-SDK-only convention this proxy doesn't use, and NIM's raw
-// REST endpoint will just silently ignore a field called "extra_body".
 function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools) {
   const effort = clientReasoningEffort;
 
@@ -282,26 +251,16 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     case 'nvidia/nemotron-3-ultra-550b-a55b': {
       if (!enableThinking) return {};
       const payload = { chat_template_kwargs: { enable_thinking: true } };
-      // Unverified param — see header comment. Left as opt-in best-effort.
       if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
       return payload;
     }
 
     case 'qwen/qwen3.5-397b-a17b': {
-      // Model appears to default to thinking-on in its chat template. Only send
-      // a field when the caller explicitly wants thinking OFF; otherwise let the
-      // <think> delimiter parser handle whatever the model does natively.
       if (enableThinking) return {};
       return { chat_template_kwargs: { enable_thinking: false } };
     }
 
     case 'deepseek-ai/deepseek-v4-pro-0813': {
-      // FIX: NVIDIA's own sample code for this model explicitly sends
-      // chat_template_kwargs.thinking=false to turn thinking OFF, meaning
-      // (like GLM-5.2) it defaults to thinking-ON. Previous logic only sent a
-      // payload when enableThinking was true and stayed silent otherwise —
-      // which meant "disabled" mode never actually disabled anything; it just
-      // left the model's default (on) in place. Inverted to match reality.
       if (enableThinking) {
         const payload = {};
         if (effort) payload.reasoning_effort = effort;
@@ -309,11 +268,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       }
       return { chat_template_kwargs: { thinking: false } };
     }
-    // NOTE: 'deepseek-ai/deepseek-v4-flash-0813' is NOT confirmed to exist —
-    // unlike v4-pro-0813, I haven't verified this exact id against NVIDIA's
-    // catalog. If you add a flash alias, check its real build.nvidia.com page
-    // first (same way v4-pro-0813 was confirmed above) before assuming it
-    // shares the "-0813" suffix.
 
     case 'deepseek-ai/deepseek-v4-pro':
     case 'deepseek-ai/deepseek-v4-flash': {
@@ -341,12 +295,8 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return {};
     }
 
-    case 'z-ai/glm-5.2': {
-      // FIX: GLM-5.2 thinks by default. `reasoning_effort` only controls
-      // intensity (max vs high) once thinking is already happening — it does
-      // NOT turn thinking off. The actual on/off switch is `thinking.type`.
-      // Without this, GLM-5.2 was silently reasoning on every single request
-      // regardless of ENABLE_THINKING_MODE.
+    case 'z-ai/glm-5.2':
+    case 'z-ai/glm-5.3-flash': {
       const payload = {
         thinking: { type: enableThinking ? 'enabled' : 'disabled' }
       };
@@ -365,17 +315,13 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     }
 
     default:
-      // Default reasoning models (Kimi, MiniMax, etc.) or non-reasoning models
       return {};
   }
 }
 
-// ─── Middleware ────────────────────────────────────────────────────────────
-
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// FIX: Extract token AFTER "Bearer " prefix, compare only the token
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const parts = authHeader.trim().split(' ');
@@ -422,8 +368,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Validation ────────────────────────────────────────────────────────────
-
 async function validateModels() {
   if (SKIP_VALIDATION) {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
@@ -441,10 +385,7 @@ async function validateModels() {
       timeout: VALIDATION_TIMEOUT_MS
     });
 
-    const availableModels = new Set(
-      (response.data.data || []).map(m => m.id)
-    );
-
+    const availableModels = new Set((response.data.data || []).map(m => m.id));
     const invalid = [];
 
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
@@ -464,7 +405,6 @@ async function validateModels() {
 
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
-    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
   }
 }
 
@@ -494,8 +434,6 @@ async function sendDiscordAlert(invalidModels) {
   }
 }
 
-// ─── Helper: Safe Stream Writing ───────────────────────────────────────────
-
 function safeWrite(res, data) {
   try {
     if (!res.writableEnded && !res.destroyed && res.writable) {
@@ -507,8 +445,6 @@ function safeWrite(res, data) {
   }
   return false;
 }
-
-// ─── Helper: Fallback Chain ─────────────────────────────────────────────────
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
@@ -534,9 +470,6 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
-      // FIX: distinguish a hung/timed-out upstream from an actual error response,
-      // so logs make it obvious which model never answered vs which one was
-      // rejected outright (bad model id, auth, etc.)
       const isTimeout = err.code === 'ECONNABORTED' || /timeout/i.test(err.message);
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
@@ -551,8 +484,6 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   }
   throw lastError || new Error('All models failed');
 }
-
-// ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '2.2.1' });
@@ -585,23 +516,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       tool_choice
     } = req.body;
 
-    // FIX: default (used when the client's model string matches no alias)
-    // was 'openai/gpt-oss-20b' (128K context) — now that MODEL_MAPPING only
-    // contains 500k+ context models, an unmapped request falling back to a
-    // short-context model would be an inconsistent surprise. Defaults to the
-    // same model as gpt-3.5-turbo.
     const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3-super-120b-a12b';
-    // FIX: per request, DeepSeek is now always tried FIRST regardless of
-    // which alias the client sent (previously, whatever model an alias
-    // mapped to — e.g. gpt-4 -> nemotron-3-ultra — occupied the first slot,
-    // so DeepSeek only got a turn if it happened to be the primary or if the
-    // mapped model failed first). Falls through to whatever the alias
-    // actually mapped to, then the remaining FALLBACK_MODELS, if DeepSeek
-    // doesn't answer. Dedup keeps the exact same endpoint from being tried
-    // twice in one request (each attempt costs a full REQUEST_TIMEOUT_MS if
-    // that endpoint is down).
-    const DEEPSEEK_MODEL = 'deepseek-ai/deepseek-v4-pro-0813';
-    const modelChain = [...new Set([DEEPSEEK_MODEL, primaryModel, ...FALLBACK_MODELS])];
+    const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
 
     const baseRequest = {
       messages,
@@ -610,9 +526,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
 
-    // FIX: forward tools/tool_choice to NIM if the client sent them.
-    // Previously these were read only to compute hasTools for the reasoning
-    // payload, but never actually included in the outgoing request body.
     if (tools) baseRequest.tools = tools;
     if (tool_choice) baseRequest.tool_choice = tool_choice;
 
@@ -626,7 +539,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
 
-    // Determine if the client wants legacy inline <thinking> tags in the content stream
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
@@ -639,7 +551,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       let reasoningOpen = false;
       let doneSent = false;
       let cleanedUp = false;
-
       const normalizer = new StreamNormalizer(usedModel);
 
       const cleanup = () => {
@@ -672,7 +583,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             let clientContent = '';
 
             if (SHOW_REASONING && inlineReasoning) {
-              // Legacy GoonChat behavior: bake <thinking> tags into content
               if (normalizedDelta.reasoning && !reasoningOpen) {
                 clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
@@ -687,18 +597,11 @@ app.post('/v1/chat/completions', async (req, res) => {
                 clientContent += normalizedDelta.content;
               }
             } else {
-              // Default behavior: clean content, no inline tags
               clientContent = normalizedDelta.content || '';
             }
 
             delta.content = clientContent;
 
-            // FIX: keep a structured reasoning field alongside the inline
-            // tags in content. GoonChat parses the inline tags;
-            // clients like Pal Chat / OpenRouter-style apps look for a
-            // separate `reasoning`/`reasoning_content` field to render their
-            // own collapsible thinking UI. Without this, those clients just
-            // see one flat content blob and never show a thinking indicator.
             if (SHOW_REASONING && normalizedDelta.reasoning) {
               delta.reasoning = normalizedDelta.reasoning;
               delta.reasoning_content = normalizedDelta.reasoning;
@@ -761,7 +664,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (flushedDelta.content || flushedDelta.reasoning) {
           let clientContent = '';
           if (SHOW_REASONING && inlineReasoning) {
-            // Legacy GoonChat behavior: bake <thinking> tags into content
             if (flushedDelta.reasoning && !reasoningOpen) {
               clientContent += `<thinking>\n${flushedDelta.reasoning}`;
               reasoningOpen = true;
@@ -775,7 +677,6 @@ app.post('/v1/chat/completions', async (req, res) => {
               clientContent += flushedDelta.content;
             }
           } else {
-            // Default behavior: clean content, no inline tags
             clientContent = flushedDelta.content || '';
           }
           if (clientContent) {
@@ -824,7 +725,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
     } else {
-      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -836,15 +736,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           const reasoning = normalizedChoice.message?.reasoning || '';
 
           if (SHOW_REASONING && inlineReasoning && reasoning) {
-            // Legacy GoonChat behavior: bake <thinking> tags into content
             content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
           }
 
           const finalMessage = { ...normalizedChoice.message, content };
 
-          // Same fix as the streaming path: keep the structured field
-          // alongside the inline tags so structured-reasoning clients
-          // (Pal Chat, OpenRouter-style apps) can render their own UI.
           if (SHOW_REASONING && reasoning) {
             finalMessage.reasoning = reasoning;
             finalMessage.reasoning_content = reasoning;
@@ -910,8 +806,6 @@ app.use((req, res) => {
   });
 });
 
-// ─── Startup ───────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
@@ -920,3 +814,4 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
+

@@ -1,36 +1,5 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
-// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
-// Consolidated Reasoning Subsystem
-//
-// === REASONING PAYLOAD FIXES (this revision) ===
-// 1. Removed the `extra_body: {...}` wrapper from getReasoningPayload(). That key only means
-//    anything inside the official openai-python/node SDK, where it gets unwrapped client-side
-//    and merged into the outgoing JSON as top-level fields. This proxy uses raw axios, so
-//    sending a literal `"extra_body"` key was dead weight — NIM never saw chat_template_kwargs,
-//    reasoning_effort, or anything else nested under it. Confirmed against NVIDIA's own curl
-//    docs, which send chat_template_kwargs directly at the top level.
-// 2. GLM-5.2 previously only ever set `reasoning_effort`, which controls thinking *intensity*,
-//    not whether thinking happens at all. GLM-5.2 thinks by default. The real switch is a
-//    top-level `thinking: { type: "enabled" | "disabled" }` field (per z.ai's own docs). Added.
-// 3. nemotron-3-ultra's `force_nonempty_content` flag is NOT a confirmed NVIDIA parameter —
-//    left in as opt-in/best-effort since unrecognized chat_template_kwargs are typically just
-//    ignored by the backend rather than causing a hard failure, but flagged here so you know
-//    it's unverified if you ever go looking for why something isn't behaving.
-//
-// === REASONING OUTPUT FORMAT FIX (this revision) ===
-// 4. Fixed reasoning leaking into message content for clients that don't parse `<thinking>` tags.
-//    Default behavior is now clean `content` + structured `reasoning`/`reasoning_content` fields.
-//    GoonChat (or any legacy client that expects inline tags) can opt-in by sending the
-//    `x-reasoning-format: inline` header.
-//
-// === THIS REVISION (bug fix) ===
-// 5. `tools` (and `tool_choice`) from the incoming request body were being read to compute
-//    `hasTools` for the reasoning payload, but were never actually forwarded to NIM in
-//    `baseRequest`. Any client sending function/tool calls would have them silently dropped
-//    upstream. Fixed below.
-// 6. Added `z-ai/glm-5.3-flash` to the supported 1M-context NVIDIA free-tier set and to the
-//    reasoning payload handling. This model is currently available in NVIDIA's NIM catalog and
-//    shares the same thinking control semantics as GLM-5.2/5.3-family models.
+// Model catalog includes NVIDIA NIM models requested for long-context chat and roleplay.
 
 require('./polyfill.js'); // must run before anything else touches globalThis
 
@@ -76,7 +45,9 @@ function validateConfig() {
 
 validateConfig();
 
-// ─── Model Mapping ─────────────────────────────────────────────────────────
+// ─── Model Mapping ──────────────────────────────────────────────────────────
+// Both friendly aliases and exact NVIDIA model IDs are exposed by /v1/models.
+// The requested models are also used as the fallback chain; no stale DeepSeek Pro ID remains.
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
@@ -90,21 +61,32 @@ const MODEL_MAPPING = {
   'claude-3-opus': 'nvidia/nemotron-3-ultra-550b-a55b',
   'mistral': 'nvidia/nemotron-3-ultra-550b-a55b',
 
-  'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
-  'deepseek': 'deepseek-ai/deepseek-v4-pro-0813',
-  'gemini-pro': 'deepseek-ai/deepseek-v4-pro-0813',
+  'gpt-4o': 'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-v4.1-flash': 'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-ai/deepseek-v4.1-flash': 'deepseek-ai/deepseek-v4.1-flash',
+  'gemini-pro': 'deepseek-ai/deepseek-v4.1-flash',
 
   'glm-5.3-flash': 'z-ai/glm-5.3-flash',
   'glm-5.3': 'z-ai/glm-5.3-flash',
   'glm-5.2': 'z-ai/glm-5.3-flash',
-  'glm-5.3-flashx': 'z-ai/glm-5.3-flash'
+  'glm-5.3-flashx': 'z-ai/glm-5.3-flash',
+  'z-ai/glm-5.3-flash': 'z-ai/glm-5.3-flash',
+
+  'step-5-preview': 'stepfun-ai/step-5-preview',
+  'stepfun-ai/step-5-preview': 'stepfun-ai/step-5-preview',
+  'laguna-xs-2.1': 'poolside/laguna-xs-2.1',
+  'poolside/laguna-xs-2.1': 'poolside/laguna-xs-2.1',
+  'nemotron-3.5-lightning-30b-a3b': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'nvidia/nemotron-3.5-lightning-30b-a3b': 'nvidia/nemotron-3.5-lightning-30b-a3b'
 };
 
 const FALLBACK_MODELS = [
-  'deepseek-ai/deepseek-v4-pro-0813',
-  'nvidia/nemotron-3-ultra-550b-a55b',
-  'nvidia/nemotron-3-super-120b-a12b',
-  'z-ai/glm-5.3-flash'
+  'deepseek-ai/deepseek-v4.1-flash',
+  'z-ai/glm-5.3-flash',
+  'stepfun-ai/step-5-preview',
+  'poolside/laguna-xs-2.1',
+  'nvidia/nemotron-3.5-lightning-30b-a3b'
 ];
 
 // ─── Reasoning Subsystem ─────────────────────────────────────────────────────
@@ -128,11 +110,8 @@ class DelimiterParser {
 
       if (tagIndex !== -1) {
         const textBefore = this.buffer.substring(0, tagIndex);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
-        }
+        if (this.inThinking) reasoning += textBefore;
+        else content += textBefore;
         this.inThinking = !this.inThinking;
         this.buffer = this.buffer.substring(tagIndex + targetTag.length);
       } else {
@@ -144,13 +123,9 @@ class DelimiterParser {
             break;
           }
         }
-
         const textBefore = this.buffer.substring(0, this.buffer.length - partialLen);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
-        }
+        if (this.inThinking) reasoning += textBefore;
+        else content += textBefore;
         this.buffer = this.buffer.substring(this.buffer.length - partialLen);
         break;
       }
@@ -162,25 +137,23 @@ class DelimiterParser {
     let content = '';
     let reasoning = '';
     if (this.buffer) {
-      if (this.inThinking) {
-        reasoning += this.buffer;
-      } else {
-        content += this.buffer;
-      }
+      if (this.inThinking) reasoning = this.buffer;
+      else content = this.buffer;
       this.buffer = '';
     }
     return { content, reasoning };
   }
 }
 
+const THINK_TAG_MODELS = new Set([
+  'qwen/qwen3.5-397b-a17b',
+  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  'z-ai/glm-5.3-flash'
+]);
+
 class StreamNormalizer {
   constructor(model) {
-    this.model = model;
-    this.parser = null;
-
-    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5' || model === 'z-ai/glm-5.3-flash') {
-      this.parser = new DelimiterParser('<think>', '</think>');
-    }
+    this.parser = THINK_TAG_MODELS.has(model) ? new DelimiterParser('<think>', '</think>') : null;
   }
 
   processDelta(delta) {
@@ -196,57 +169,43 @@ class StreamNormalizer {
 
     if (content) normalizedDelta.content = content;
     else delete normalizedDelta.content;
-
     if (reasoning) normalizedDelta.reasoning = reasoning;
     else delete normalizedDelta.reasoning;
-
     delete normalizedDelta.reasoning_content;
     return normalizedDelta;
   }
 
   flush() {
-    if (!this.parser) return { content: '', reasoning: '' };
-    return this.parser.flush();
+    return this.parser ? this.parser.flush() : { content: '', reasoning: '' };
   }
 }
 
 function normalizeNonStreamChoice(choice, model) {
   if (!choice) return choice;
-
   const message = choice.message || {};
   let reasoning = message.reasoning || message.reasoning_content || '';
   let content = message.content || '';
 
-  if (!reasoning && content) {
-    let parser = null;
-    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5' || model === 'z-ai/glm-5.3-flash') {
-      parser = new DelimiterParser('<think>', '</think>');
-    }
-
-    if (parser) {
-      const parsed = parser.processChunk(content);
-      const flushed = parser.flush();
-      content = (parsed.content || '') + (flushed.content || '');
-      reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
-    }
+  if (!reasoning && content && THINK_TAG_MODELS.has(model)) {
+    const parser = new DelimiterParser('<think>', '</think>');
+    const parsed = parser.processChunk(content);
+    const flushed = parser.flush();
+    content = (parsed.content || '') + (flushed.content || '');
+    reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
   }
 
   const newMessage = { ...message };
   if (content) newMessage.content = content;
   if (reasoning) newMessage.reasoning = reasoning;
   delete newMessage.reasoning_content;
-
   return { ...choice, message: newMessage };
 }
 
 function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools) {
   const effort = clientReasoningEffort;
-
   switch (model) {
-    case 'nvidia/nemotron-3-super-120b-a12b': {
-      if (!enableThinking) return {};
-      return { chat_template_kwargs: { enable_thinking: true } };
-    }
+    case 'nvidia/nemotron-3-super-120b-a12b':
+      return enableThinking ? { chat_template_kwargs: { enable_thinking: true } } : {};
 
     case 'nvidia/nemotron-3-ultra-550b-a55b': {
       if (!enableThinking) return {};
@@ -255,64 +214,35 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return payload;
     }
 
-    case 'qwen/qwen3.5-397b-a17b': {
-      if (enableThinking) return {};
-      return { chat_template_kwargs: { enable_thinking: false } };
-    }
+    case 'qwen/qwen3.5-397b-a17b':
+      return enableThinking ? {} : { chat_template_kwargs: { enable_thinking: false } };
 
-    case 'deepseek-ai/deepseek-v4-pro-0813': {
-      if (enableThinking) {
-        const payload = {};
-        if (effort) payload.reasoning_effort = effort;
-        return payload;
-      }
-      return { chat_template_kwargs: { thinking: false } };
-    }
-
-    case 'deepseek-ai/deepseek-v4-pro':
-    case 'deepseek-ai/deepseek-v4-flash': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { thinking: true } };
-      if (effort) payload.chat_template_kwargs.reasoning_effort = effort;
-      return payload;
+    case 'deepseek-ai/deepseek-v4.1-flash': {
+      // Do not send undocumented template flags; only forward an effort when thinking is enabled.
+      return enableThinking && effort ? { reasoning_effort: effort } : {};
     }
 
     case 'openai/gpt-oss-120b':
-    case 'openai/gpt-oss-20b': {
-      if (effort && ['low', 'medium', 'high'].includes(effort)) {
-        return { reasoning_effort: effort };
-      }
-      if (enableThinking) return { reasoning_effort: 'high' };
-      return {};
-    }
+    case 'openai/gpt-oss-20b':
+      if (effort && ['low', 'medium', 'high'].includes(effort)) return { reasoning_effort: effort };
+      return enableThinking ? { reasoning_effort: 'high' } : {};
 
     case 'mistralai/mistral-medium-3.5-128b':
-    case 'mistralai/mistral-small-4-119b-2603': {
-      if (effort && ['high', 'none'].includes(effort)) {
-        return { reasoning_effort: effort };
-      }
-      if (enableThinking) return { reasoning_effort: 'high' };
-      return {};
-    }
+    case 'mistralai/mistral-small-4-119b-2603':
+      if (effort && ['high', 'none'].includes(effort)) return { reasoning_effort: effort };
+      return enableThinking ? { reasoning_effort: 'high' } : {};
 
-    case 'z-ai/glm-5.2':
     case 'z-ai/glm-5.3-flash': {
-      const payload = {
-        thinking: { type: enableThinking ? 'enabled' : 'disabled' }
-      };
+      const payload = { thinking: { type: enableThinking ? 'enabled' : 'disabled' } };
       if (enableThinking && effort) payload.reasoning_effort = effort;
       return payload;
     }
 
-    case 'google/gemma-4-31b-it': {
-      if (!enableThinking) return {};
-      return { chat_template_kwargs: { enable_thinking: true } };
-    }
+    case 'google/gemma-4-31b-it':
+      return enableThinking ? { chat_template_kwargs: { enable_thinking: true } } : {};
 
-    case 'stepfun-ai/step-3.7-flash': {
-      if (enableThinking) return {};
-      return { chat_template_kwargs: { thinking: false } };
-    }
+    case 'stepfun-ai/step-3.7-flash':
+      return enableThinking ? {} : { chat_template_kwargs: { thinking: false } };
 
     default:
       return {};
@@ -339,32 +269,14 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models') {
-    return next();
-  }
-
+  if (req.path === '/health' || req.path === '/v1/models') return next();
   const token = extractBearerToken(req.headers.authorization);
-
   if (!token || !CLIENT_AUTH_KEY) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden: Invalid or missing authentication',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
+    return res.status(403).json({ error: { message: 'Forbidden: Invalid or missing authentication', type: 'authentication_error', code: 403 } });
   }
-
   if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden: Invalid authentication credentials',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
+    return res.status(403).json({ error: { message: 'Forbidden: Invalid authentication credentials', type: 'authentication_error', code: 403 } });
   }
-
   next();
 });
 
@@ -373,36 +285,23 @@ async function validateModels() {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
     return;
   }
-
   console.log('[VALIDATION] Checking model availability via /v1/models...');
-
   try {
     const response = await axios.get(`${NIM_API_BASE}/models`, {
-      headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: VALIDATION_TIMEOUT_MS
     });
-
     const availableModels = new Set((response.data.data || []).map(m => m.id));
     const invalid = [];
-
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
-      if (availableModels.has(nimId)) {
-        console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
-      } else {
+      if (availableModels.has(nimId)) console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
+      else {
         console.warn(`[VALIDATION] ✗ ${alias} → ${nimId} (not in catalog)`);
         invalid.push({ alias, nimId, error: 'Model not found in NIM catalog' });
       }
     }
-
-    if (invalid.length > 0) {
-      await sendDiscordAlert(invalid);
-    } else {
-      console.log('[VALIDATION] All models valid.');
-    }
-
+    if (invalid.length > 0) await sendDiscordAlert(invalid);
+    else console.log('[VALIDATION] All models valid.');
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
   }
@@ -410,24 +309,15 @@ async function validateModels() {
 
 async function sendDiscordAlert(invalidModels) {
   if (!DISCORD_WEBHOOK_URL) return;
-
   const embed = {
     title: '⚠️ NIM Proxy: Model Validation Failed',
     description: `${invalidModels.length} model(s) failed validation. Check NIM catalog for deprecations.`,
     color: 0xff4444,
     timestamp: new Date().toISOString(),
-    fields: invalidModels.map(m => ({
-      name: `\`${m.alias}\``,
-      value: `Backend: \`${m.nimId}\`\nError: \`${m.error}\``,
-      inline: true
-    }))
+    fields: invalidModels.map(m => ({ name: `\`${m.alias}\``, value: `Backend: \`${m.nimId}\`\nError: \`${m.error}\``, inline: true }))
   };
-
   try {
-    await axios.post(DISCORD_WEBHOOK_URL, {
-      embeds: [embed],
-      username: 'NIM Proxy Monitor'
-    }, { timeout: 5000 });
+    await axios.post(DISCORD_WEBHOOK_URL, { embeds: [embed], username: 'NIM Proxy Monitor' }, { timeout: 5000 });
     console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
@@ -448,123 +338,75 @@ function safeWrite(res, data) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
-
   for (const model of models) {
     try {
       const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-
-      const res = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model, ...reasoningPayload },
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: REQUEST_TIMEOUT_MS
-        }
-      );
-
-      return { response: res, model };
-
+      const response = await axios.post(`${NIM_API_BASE}/chat/completions`, { ...baseRequest, model, ...reasoningPayload }, {
+        headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
+        responseType: baseRequest.stream ? 'stream' : 'json',
+        timeout: REQUEST_TIMEOUT_MS
+      });
+      return { response, model };
     } catch (err) {
       lastError = err;
       const isTimeout = err.code === 'ECONNABORTED' || /timeout/i.test(err.message);
-      console.warn(
-        `[FALLBACK] Model failed: ${model}`,
-        isTimeout ? `TIMED OUT after ${REQUEST_TIMEOUT_MS}ms` : (err.response?.status || ''),
-        err.response?.data?.error?.message || err.message
-      );
+      console.warn(`[FALLBACK] Model failed: ${model}`, isTimeout ? `TIMED OUT after ${REQUEST_TIMEOUT_MS}ms` : (err.response?.status || ''), err.response?.data?.error?.message || err.message);
     }
   }
-
-  if (lastError) {
-    lastError.lastAttemptedModel = models[models.length - 1];
-  }
+  if (lastError) lastError.lastAttemptedModel = models[models.length - 1];
   throw lastError || new Error('All models failed');
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.2.1' });
+  res.json({ status: 'ok', version: '2.3.0' });
 });
 
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: Object.keys(MODEL_MAPPING).map(id => ({
-      id,
-      object: 'model',
-      created: Date.now(),
-      owned_by: 'nim-proxy'
-    }))
+    data: Object.keys(MODEL_MAPPING).map(id => ({ id, object: 'model', created: Date.now(), owned_by: 'nim-proxy' }))
   });
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
   let upstreamStream = null;
-
   try {
-    const {
-      model,
-      messages,
-      temperature,
-      max_tokens,
-      stream,
-      tools,
-      tool_choice
-    } = req.body;
-
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3-super-120b-a12b';
+    const { model, messages, temperature, max_tokens, stream, tools, tool_choice } = req.body;
+    const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3.5-lightning-30b-a3b';
     const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
-
     const baseRequest = {
       messages,
       temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false
     };
-
     if (tools) baseRequest.tools = tools;
     if (tool_choice) baseRequest.tool_choice = tool_choice;
 
-    const { response, model: usedModel } = await callWithFallback(
-      baseRequest,
-      modelChain,
-      ENABLE_THINKING_MODE,
-      req.body.reasoning_effort,
-      !!req.body.tools
-    );
+    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain, ENABLE_THINKING_MODE, req.body.reasoning_effort, !!tools);
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
-
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
       const decoder = new StringDecoder('utf8');
       let buffer = '';
       let reasoningOpen = false;
       let doneSent = false;
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
-
       const cleanup = () => {
         if (cleanedUp) return;
         cleanedUp = true;
-        if (upstreamStream) {
-          upstreamStream.removeAllListeners();
-        }
+        if (upstreamStream) upstreamStream.removeAllListeners();
         req.removeAllListeners('close');
       };
-
       const processLine = (line) => {
         if (!line.startsWith('data: ')) return;
-
         if (line.includes('[DONE]')) {
           if (!doneSent) {
             safeWrite(res, 'data: [DONE]\n\n');
@@ -573,35 +415,23 @@ app.post('/v1/chat/completions', async (req, res) => {
           streamEndedCleanly = true;
           return;
         }
-
         try {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
-
           if (delta) {
             const normalizedDelta = normalizer.processDelta(delta);
             let clientContent = '';
-
             if (SHOW_REASONING && inlineReasoning) {
               if (normalizedDelta.reasoning && !reasoningOpen) {
                 clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
-              } else if (normalizedDelta.reasoning) {
-                clientContent += normalizedDelta.reasoning;
-              }
-
+              } else if (normalizedDelta.reasoning) clientContent += normalizedDelta.reasoning;
               if (normalizedDelta.content && reasoningOpen) {
                 clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
                 reasoningOpen = false;
-              } else if (normalizedDelta.content) {
-                clientContent += normalizedDelta.content;
-              }
-            } else {
-              clientContent = normalizedDelta.content || '';
-            }
-
+              } else if (normalizedDelta.content) clientContent += normalizedDelta.content;
+            } else clientContent = normalizedDelta.content || '';
             delta.content = clientContent;
-
             if (SHOW_REASONING && normalizedDelta.reasoning) {
               delta.reasoning = normalizedDelta.reasoning;
               delta.reasoning_content = normalizedDelta.reasoning;
@@ -610,56 +440,31 @@ app.post('/v1/chat/completions', async (req, res) => {
               delete delta.reasoning_content;
             }
           }
-
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
-
         } catch (parseErr) {
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Upstream sent malformed chunk',
-              type: 'stream_parse_error',
-              details: line.slice(0, 100)
-            }
-          })}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify({ error: { message: 'Upstream sent malformed chunk', type: 'stream_parse_error', details: line.slice(0, 100) } })}\n\n`);
         }
       };
 
       upstreamStream.on('data', chunk => {
         buffer += decoder.write(chunk);
-
         if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Stream buffer overflow',
-              type: 'stream_error'
-            }
-          })}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify({ error: { message: 'Stream buffer overflow', type: 'stream_error' } })}\n\n`);
           safeWrite(res, 'data: [DONE]\n\n');
           res.end();
           upstreamStream.destroy();
           cleanup();
           return;
         }
-
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          processLine(line);
-        }
+        for (const line of lines) processLine(line);
       });
-
       upstreamStream.on('end', () => {
         buffer += decoder.end();
-
-        if (buffer.trim()) {
-          for (const line of buffer.split('\n')) {
-            processLine(line);
-          }
-        }
-
+        if (buffer.trim()) for (const line of buffer.split('\n')) processLine(line);
         const flushedDelta = normalizer.flush();
         if (flushedDelta.content || flushedDelta.reasoning) {
           let clientContent = '';
@@ -667,80 +472,46 @@ app.post('/v1/chat/completions', async (req, res) => {
             if (flushedDelta.reasoning && !reasoningOpen) {
               clientContent += `<thinking>\n${flushedDelta.reasoning}`;
               reasoningOpen = true;
-            } else if (flushedDelta.reasoning) {
-              clientContent += flushedDelta.reasoning;
-            }
+            } else if (flushedDelta.reasoning) clientContent += flushedDelta.reasoning;
             if (flushedDelta.content && reasoningOpen) {
               clientContent += `\n</thinking>\n\n${flushedDelta.content}`;
               reasoningOpen = false;
-            } else if (flushedDelta.content) {
-              clientContent += flushedDelta.content;
-            }
-          } else {
-            clientContent = flushedDelta.content || '';
-          }
-          if (clientContent) {
-            safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: clientContent } }] })}\n\n`);
-          }
+            } else if (flushedDelta.content) clientContent += flushedDelta.content;
+          } else clientContent = flushedDelta.content || '';
+          if (clientContent) safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: clientContent } }] })}\n\n`);
         }
-
-        if (!doneSent) {
-          safeWrite(res, 'data: [DONE]\n\n');
-        }
-
+        if (!doneSent) safeWrite(res, 'data: [DONE]\n\n');
         streamEndedCleanly = true;
-        if (!res.writableEnded) {
-          res.end();
-        }
+        if (!res.writableEnded) res.end();
         cleanup();
       });
-
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
-
         if (!res.writableEnded) {
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Stream interrupted by upstream error',
-              type: 'stream_error'
-            }
-          })}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify({ error: { message: 'Stream interrupted by upstream error', type: 'stream_error' } })}\n\n`);
           safeWrite(res, 'data: [DONE]\n\n');
           res.end();
         }
         cleanup();
       });
-
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
-
-        if (!streamEndedCleanly && clientGone) {
-          console.warn('[STREAM] Client disconnected prematurely');
-        }
-
-        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
-          upstreamStream.destroy();
-        }
+        if (!streamEndedCleanly && clientGone) console.warn('[STREAM] Client disconnected prematurely');
+        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) upstreamStream.destroy();
         cleanup();
       });
-
     } else {
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: (response.data.choices || []).map((choice, i) => {
           const normalizedChoice = normalizeNonStreamChoice(choice, usedModel);
           let content = normalizedChoice.message?.content || '';
           const reasoning = normalizedChoice.message?.reasoning || '';
-
-          if (SHOW_REASONING && inlineReasoning && reasoning) {
-            content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
-          }
-
+          if (SHOW_REASONING && inlineReasoning && reasoning) content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
           const finalMessage = { ...normalizedChoice.message, content };
-
           if (SHOW_REASONING && reasoning) {
             finalMessage.reasoning = reasoning;
             finalMessage.reasoning_content = reasoning;
@@ -748,70 +519,32 @@ app.post('/v1/chat/completions', async (req, res) => {
             delete finalMessage.reasoning;
             delete finalMessage.reasoning_content;
           }
-
-          const finalChoice = {
-            ...normalizedChoice,
-            index: i,
-            message: finalMessage
-          };
-          return finalChoice;
+          return { ...normalizedChoice, index: i, message: finalMessage };
         }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
+        usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       };
-
       res.json(openaiResponse);
     }
-
   } catch (error) {
     console.error('[PROXY] Fatal error:', error.message, error.lastAttemptedModel ? `(last tried: ${error.lastAttemptedModel})` : '');
     console.error('[PROXY] NIM response:', error.response?.data);
-
     if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
-        error: {
-          message: error.message,
-          type: 'invalid_request_error',
-          code: error.response?.status || 500,
-          last_attempted_model: error.lastAttemptedModel
-        }
-      });
+      res.status(error.response?.status || 500).json({ error: { message: error.message, type: 'invalid_request_error', code: error.response?.status || 500, last_attempted_model: error.lastAttemptedModel } });
     } else if (!res.writableEnded) {
-      safeWrite(res, `data: ${JSON.stringify({
-        error: {
-          message: error.message,
-          type: 'proxy_error'
-        }
-      })}\n\n`);
+      safeWrite(res, `data: ${JSON.stringify({ error: { message: error.message, type: 'proxy_error' } })}\n\n`);
       safeWrite(res, 'data: [DONE]\n\n');
       res.end();
     }
-
-    if (upstreamStream && !upstreamStream.destroyed) {
-      upstreamStream.destroy();
-    }
+    if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
   }
 });
 
 app.use((req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.method} ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
+  res.status(404).json({ error: { message: `Endpoint ${req.method} ${req.path} not found`, type: 'invalid_request_error', code: 404 } });
 });
 
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
-
-  validateModels().catch(err => {
-    console.error('[VALIDATION] Startup check failed:', err.message);
-  });
+  validateModels().catch(err => console.error('[VALIDATION] Startup check failed:', err.message));
 });
-
